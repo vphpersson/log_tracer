@@ -1,1 +1,0 @@
-git+https://github.com/vphpersson/ecs_py.git#egg=ecs_py

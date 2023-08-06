@@ -1,4 +1,4 @@
-from typing import Final, Optional, NoReturn, Callable, Any, Union
+from typing import Final, NoReturn, Callable, Any
 from pathlib import Path
 from collections import defaultdict
 from contextlib import suppress
@@ -96,7 +96,6 @@ struct ipv4_flow_key_t {
     u32 daddr;
     u16 dport;
 };
-
 
 BPF_PERF_OUTPUT(ipv4_events);
 BPF_PERF_OUTPUT(ipv6_events);
@@ -260,13 +259,14 @@ TRACEPOINT_PROBE(sched, sched_process_exit) {
 }
 """
 
-ValueType = Union[ProcessInfo, ConnectionInfo]
+
+ValueType = ProcessInfo | ConnectionInfo
 
 
 class LogTracer:
 
     def __init__(self):
-        self._bpf_instance: Optional[BPF] = None
+        self._bpf_instance: BPF | None = None
 
         self._pid_to_argv: dict[int, list[str]] = defaultdict(list)
         self._pid_to_num_exec_calls: dict[int, int] = defaultdict(int)
@@ -285,8 +285,8 @@ class LogTracer:
 
     def register_callback(
         self,
-        callback_function: Callable[[Union[ProcessInfo, ConnectionInfo], ...], Any],
-        callback_type: Optional[CallbackType] = None
+        callback_function: Callable[[ProcessInfo | ConnectionInfo, ...], Any],
+        callback_type: CallbackType | None = None
     ) -> None:
         """
         Register a callback.
@@ -305,7 +305,7 @@ class LogTracer:
     def unregister_callback(
         self,
         callback_function: Callable[[ValueType, ...], Any],
-        callback_type: Optional[CallbackType] = None
+        callback_type: CallbackType | None = None
     ) -> None:
         """
 
@@ -355,6 +355,25 @@ class LogTracer:
         while True:
             self._bpf_instance.perf_buffer_poll()
 
+    @staticmethod
+    def _make_default_process_info(event) -> ProcessInfo:
+        return ProcessInfo(
+            name=event.comm.decode(),
+            pid=event.ppid,
+            ppid=event.ppid,
+            user_name=getpwuid(event.uid).pw_name,
+            user_id=event.uid
+        )
+
+    def _get_process_info(self, pid: int, event=None) -> ProcessInfo | None:
+        if process_info := self.pid_to_process_info.get(pid):
+            return process_info
+        else:
+            try:
+                return get_info_from_proc(pid=pid)
+            except (FileNotFoundError, ProcessLookupError):
+                return LogTracer._make_default_process_info(event=event) if event else None
+
     def _handle_arg_events(self, cpu, data, size) -> None:
         event = self._bpf_instance['arg_events'].event(data)
         self._pid_to_argv[event.pid].append(event.argv.decode())
@@ -368,7 +387,7 @@ class LogTracer:
                 executable = str(Path(f'/proc/{event.pid}/exe').resolve())
 
         # TODO: It would be nice if I could retrieve this in the BPF code...
-        working_directory: Optional[str] = None
+        working_directory: str | None = None
         with suppress(Exception):
             working_directory = str(Path(f'/proc/{event.pid}/cwd').resolve())
 
@@ -386,13 +405,7 @@ class LogTracer:
             exec_time=(boot_time + timedelta(microseconds=(event.start_boottime + (event.exec_time - event.start_time)) / 1000)).astimezone(),
         )
 
-        parent_process_info: Optional[ProcessInfo] = self.pid_to_process_info.get(event.ppid)
-
-        if not parent_process_info:
-            with suppress(FileNotFoundError, ProcessLookupError):
-                parent_process_info: ProcessInfo = get_info_from_proc(pid=event.ppid)
-
-        if parent_process_info:
+        if parent_process_info := self._get_process_info(pid=event.ppid):
             self.pid_to_process_info[event.ppid] = parent_process_info
             process_info.parent = parent_process_info
 
@@ -428,20 +441,12 @@ class LogTracer:
     def _handle_process_exit_events(self, cpu, data, size) -> None:
         event = self._bpf_instance['process_exit_events'].event(data)
 
-        process_info: Optional[ProcessInfo] = self.pid_to_process_info.pop(event.pid, None)
+        process_info: ProcessInfo | None = self.pid_to_process_info.pop(event.pid, None)
         if not process_info:
-            process_info = ProcessInfo(
-                name=event.comm.decode(),
-                pid=event.pid,
-                ppid=event.ppid,
-                user_name=getpwuid(event.uid).pw_name,
-                user_id=event.uid
-            )
+            process_info = LogTracer._make_default_process_info(event=event)
 
-        parent_process_info: Optional[ProcessInfo] = self.pid_to_process_info.get(event.ppid)
-        if not parent_process_info:
-            with suppress(FileNotFoundError, ProcessLookupError):
-                parent_process_info: ProcessInfo = get_info_from_proc(pid=event.ppid)
+        if parent_process_info := self._get_process_info(pid=event.ppid):
+            process_info.parent = parent_process_info
 
         boot_time: datetime = get_boot_time()
         uptime_ns: int = event.exit_time - event.start_time
@@ -449,7 +454,6 @@ class LogTracer:
         process_info.exit_code = event.exit_code
         process_info.end = (boot_time + timedelta(microseconds=(event.start_boottime + uptime_ns) / 1000)).astimezone()
         process_info.uptime_ns = uptime_ns
-        process_info.parent = parent_process_info
 
         self._call_callback(value=process_info, callback_type=CallbackType.PROCESS_EXIT, use_global=False)
         self._call_callback(value=process_info, callback_type=CallbackType.PROCESS_EXIT, use_global=True)
@@ -457,30 +461,10 @@ class LogTracer:
     def _handle_ipv4_events(self, cpu, data, size) -> None:
         event = self._bpf_instance['ipv4_events'].event(data)
 
-        process_info = self.pid_to_process_info.get(event.pid)
-
-        if not process_info:
-            with suppress(FileNotFoundError, ProcessLookupError):
-                process_info = get_info_from_proc(pid=event.pid)
-
-        if not process_info:
-            process_info = ProcessInfo(
-                name=event.comm.decode(),
-                pid=event.pid,
-                ppid=event.ppid,
-                user_name=getpwuid(event.uid).pw_name,
-                user_id=event.uid
-            )
-
+        process_info: ProcessInfo = self._get_process_info(pid=event.pid, event=event)
         self.pid_to_process_info[event.pid] = process_info
 
-        parent_process_info: Optional[ProcessInfo] = self.pid_to_process_info.get(event.ppid)
-
-        if not parent_process_info:
-            with suppress(FileNotFoundError, ProcessLookupError):
-                parent_process_info: ProcessInfo = get_info_from_proc(pid=event.ppid)
-
-        if parent_process_info:
+        if parent_process_info := self._get_process_info(pid=event.ppid):
             self.pid_to_process_info[event.ppid] = parent_process_info
             process_info.parent = parent_process_info
 
